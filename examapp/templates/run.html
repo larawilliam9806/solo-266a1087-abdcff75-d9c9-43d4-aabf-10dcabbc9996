@@ -19,7 +19,7 @@
 </section>
 
 <section class="card">
-  <h2 id="flagged-heading">待核题格 <span class="badge">{{ run.flagged|length }}</span></h2>
+  <h2 id="flagged-heading">待核题格 <span class="badge">{{ run.flagged_total }}</span></h2>
   {% if run.flagged %}
     <table class="compact">
       <thead><tr><th>卡号</th><th>题码</th><th>分歧说明</th><th>人工核对</th></tr></thead>
@@ -50,6 +50,17 @@
       {% endfor %}
       </tbody>
     </table>
+    {% if run.flagged_total > run.flagged_page_size %}
+      <p class="pager">
+        {% if run.flagged_offset > 0 %}
+          <a class="button ghost" href="{{ url_for('run_detail', run_id=run.id, flagged_offset=[run.flagged_offset - run.flagged_page_size, 0]|max) }}#flagged-heading">上一页</a>
+        {% endif %}
+        <span class="muted small">第 {{ run.flagged_offset + 1 }}–{{ run.flagged_offset + run.flagged|length }} / {{ run.flagged_total }} 处</span>
+        {% if run.flagged_offset + run.flagged_page_size < run.flagged_total %}
+          <a class="button ghost" href="{{ url_for('run_detail', run_id=run.id, flagged_offset=run.flagged_offset + run.flagged_page_size) }}#flagged-heading">下一页</a>
+        {% endif %}
+      </p>
+    {% endif %}
   {% else %}
     <p class="muted">没有待核题格。</p>
   {% endif %}
@@ -81,7 +92,7 @@
 
 {% if run.unmatched %}
 <section class="card">
-  <h2>无可相容卷式的卡 <span class="badge">{{ run.unmatched|length }}</span></h2>
+  <h2>无可相容卷式的卡 <span class="badge">{{ run.unmatched_total }}</span></h2>
   <table class="compact">
     <thead><tr><th>卡号</th><th>说明</th></tr></thead>
     <tbody>
@@ -90,6 +101,9 @@
     {% endfor %}
     </tbody>
   </table>
+  {% if run.unmatched_total > run.unmatched|length %}
+    <p class="muted small">仅显示前 {{ run.unmatched|length }} 张，共 {{ run.unmatched_total }} 张。</p>
+  {% endif %}
 </section>
 {% endif %}
 {% endblock %}

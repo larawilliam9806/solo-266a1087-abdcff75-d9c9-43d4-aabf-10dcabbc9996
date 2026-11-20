@@ -68,7 +68,7 @@
 
 {% if run.unmatched %}
 <section class="card">
-  <h2>无可相容卷式的卡 <span class="badge">{{ run.unmatched|length }}</span></h2>
+  <h2>无可相容卷式的卡 <span class="badge">{{ run.unmatched_total }}</span></h2>
   <p class="muted">这些卡与任何现有卷式都不吻合，暂未计入任何统计。补交或订正卷式后会自动重判。</p>
   <table class="compact">
     <thead><tr><th>卡号</th><th>说明</th></tr></thead>
@@ -78,6 +78,9 @@
     {% endfor %}
     </tbody>
   </table>
+  {% if run.unmatched_total > run.unmatched|length %}
+    <p class="muted small">仅显示前 {{ run.unmatched|length }} 张，共 {{ run.unmatched_total }} 张，详见 <a href="{{ url_for('cards') }}">卡号明细</a>。</p>
+  {% endif %}
 </section>
 {% endif %}
 

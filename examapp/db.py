@@ -89,6 +89,8 @@ CREATE TABLE IF NOT EXISTS run_unmatched (
     detail  TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (run_id, card_no)
 );
+CREATE INDEX IF NOT EXISTS idx_run_unmatched_run
+    ON run_unmatched(run_id, card_no);
 
 CREATE TABLE IF NOT EXISTS jobs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,

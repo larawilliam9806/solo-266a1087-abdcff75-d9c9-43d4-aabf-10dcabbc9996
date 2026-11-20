@@ -156,3 +156,5 @@ td.danger { color: var(--danger); font-weight: 600; }
   main { padding: 14px; }
   .topbar { gap: 12px; padding: 10px 14px; }
 }
+
+.pager { display: flex; align-items: center; gap: 12px; margin: 10px 0 0; flex-wrap: wrap; }

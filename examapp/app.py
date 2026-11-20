@@ -200,8 +200,7 @@ def _apply_mutation(conn, kind: str, payload: dict) -> int:
         else:
             raise ValueError(f"未知任务类型：{kind}")
 
-        analysis = engine.compute(conn)
-        run_id = engine.persist_run(conn, analysis, utcnow())
+        run_id, _analysis = engine.compute_and_persist(conn, utcnow())
         set_meta(conn, "active_run_id", str(run_id))
         set_meta(conn, "state_version",
                  str(int(get_meta(conn, "state_version", "0")) + 1))
@@ -218,13 +217,24 @@ def _apply_mutation(conn, kind: str, payload: dict) -> int:
 # --------------------------------------------------------------------------
 
 def _do_upload_answers(conn, payload):
-    rows = engine.parse_answer_csv(payload["csv"].encode("utf-8"))
+    # Stream the CSV in bounded chunks so peak memory does not depend on the
+    # number of rows.  A duplicate (card, question) is rejected by the primary
+    # key and rolls the whole import back.
     conn.execute("DELETE FROM answer_rows")
-    conn.executemany(
-        "INSERT INTO answer_rows(card_no, q_no, letter, scanned_code) "
-        "VALUES (?, ?, ?, ?)",
-        [(r["card_no"], r["q_no"], r["letter"], r["scanned_code"]) for r in rows],
-    )
+    batch = []
+    for row in engine.iter_answer_csv(payload["csv"]):
+        batch.append((row["card_no"], row["q_no"], row["letter"], row["scanned_code"]))
+        if len(batch) >= engine.CARD_BATCH_SIZE * 20:
+            conn.executemany(
+                "INSERT INTO answer_rows(card_no, q_no, letter, scanned_code) "
+                "VALUES (?, ?, ?, ?)", batch,
+            )
+            batch.clear()
+    if batch:
+        conn.executemany(
+            "INSERT INTO answer_rows(card_no, q_no, letter, scanned_code) "
+            "VALUES (?, ?, ?, ?)", batch,
+        )
 
 
 def _do_upload_form(conn, payload):
@@ -318,7 +328,13 @@ def _do_set_decision(conn, payload):
 # Read helpers
 # --------------------------------------------------------------------------
 
-def read_run(conn, run_id: int) -> dict | None:
+FLAGGED_PAGE_SIZE = 200
+UNMATCHED_PAGE_SIZE = 200
+CARD_PAGE_SIZE = 200
+
+
+def read_run_stats(conn, run_id: int) -> dict | None:
+    """Question-level aggregates only: bounded by questions, not by cards."""
     if not run_id:
         return None
     run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
@@ -342,47 +358,120 @@ def read_run(conn, run_id: int) -> dict | None:
         if r["std_code"] in stats:
             stats[r["std_code"]]["options"][r["std_option"]] = r["cnt"]
 
-    cards: dict[str, list] = {}
-    flagged: list[dict] = []
-    for r in conn.execute(
-        "SELECT card_no, std_code, status, std_option, detail FROM run_card_results "
-        "WHERE run_id = ? AND std_code <> '' ORDER BY card_no, std_code",
-        (run_id,),
-    ):
-        row = dict(r)
-        cards.setdefault(r["card_no"], []).append(row)
-        if r["status"] == "flagged":
-            flagged.append(row)
-
-    unmatched = [
-        dict(r) for r in conn.execute(
-            "SELECT card_no, detail FROM run_unmatched WHERE run_id = ? ORDER BY card_no",
-            (run_id,),
-        )
-    ]
-
     return {
         "id": run["id"],
         "created_at": run["created_at"],
         "summary": json.loads(run["summary_json"] or "{}"),
         "stats": {code: stats[code] for code in sorted(stats, key=engine._natural_key)},
-        "cards": cards,
-        "flagged": flagged,
-        "unmatched": unmatched,
         "all_options": sorted(
             {o for s in stats.values() for o in s["options"]},
             key=engine._natural_key,
         ),
-        "decisions": {
-            (r["card_no"], r["std_code"]): dict(r)
-            for r in conn.execute(
-                "SELECT * FROM review_decisions WHERE card_no IN "
-                "(SELECT card_no FROM run_card_results WHERE run_id = ?) "
-                "AND std_code IN (SELECT std_code FROM run_question_stats WHERE run_id = ?)",
-                (run_id, run_id),
-            )
-        },
     }
+
+
+def read_run(conn, run_id: int, *, include_cards: bool = False,
+             flagged_offset: int = 0, cards_offset: int = 0) -> dict | None:
+    """A snapshot view whose memory use stays flat as the card count grows.
+
+    * per-question aggregates come from ``run_question_stats``;
+    * flagged cells are paged (``FLAGGED_PAGE_SIZE`` per page);
+    * the per-card table is an aggregate (counts per status), only loaded for
+      the card-detail page;
+    * a single card's per-question detail has its own query
+      (:func:`read_card_cells`).
+    """
+    view = read_run_stats(conn, run_id)
+    if view is None:
+        return None
+
+    flagged_total = int(view["summary"].get("flagged_cells") or 0)
+    flagged = [
+        dict(r) for r in conn.execute(
+            "SELECT card_no, std_code, status, std_option, detail "
+            "FROM run_card_results WHERE run_id = ? AND status = 'flagged' "
+            "ORDER BY card_no, std_code LIMIT ? OFFSET ?",
+            (run_id, FLAGGED_PAGE_SIZE, max(0, flagged_offset)),
+        )
+    ]
+
+    decisions: dict[tuple[str, str], dict] = {}
+    if flagged:
+        pairs = [(r["card_no"], r["std_code"]) for r in flagged]
+        marks = ",".join(["(?,?)"] * len(pairs))
+        for r in conn.execute(
+            f"SELECT * FROM review_decisions WHERE (card_no, std_code) IN (VALUES {marks})",
+            [value for pair in pairs for value in pair],
+        ):
+            decisions[(r["card_no"], r["std_code"])] = dict(r)
+
+    unmatched_total = int(view["summary"].get("cards_unmatched") or 0)
+    unmatched = [
+        dict(r) for r in conn.execute(
+            "SELECT card_no, detail FROM run_unmatched WHERE run_id = ? "
+            "ORDER BY card_no LIMIT ?", (run_id, UNMATCHED_PAGE_SIZE),
+        )
+    ]
+
+    cards_total = 0
+    cards: dict[str, list[int]] = {}
+    if include_cards:
+        # Only cards that matched at least one form have per-question rows
+        # (unmatched cards are stored with std_code = '').
+        cards_total = int(view["summary"].get("cards_matched") or 0)
+        # One page of card numbers, then their per-status counts.  Never the
+        # full per-question detail for every card.
+        start = max(0, cards_offset)
+        page = [
+            r["card_no"] for r in conn.execute(
+                "SELECT DISTINCT card_no FROM run_card_results WHERE run_id = ? "
+                "AND std_code <> '' ORDER BY card_no LIMIT ? OFFSET ?",
+                (run_id, CARD_PAGE_SIZE, start),
+            )
+        ]
+        if page:
+            marks = ",".join("?" * len(page))
+            counts: dict[str, list[int]] = {}
+            for r in conn.execute(
+                "SELECT card_no, status, COUNT(*) AS cnt FROM run_card_results "
+                f"WHERE run_id = ? AND card_no IN ({marks}) AND std_code <> '' "
+                "GROUP BY card_no, status",
+                [run_id, *page],
+            ):
+                slot = {"counted": 0, "blank": 1, "flagged": 2}.get(r["status"], 3)
+                row = counts.setdefault(r["card_no"], [0, 0, 0, 0])
+                row[slot] += r["cnt"]
+            # Preserve the page's card-number order for stable rendering.
+            cards = {card_no: counts.get(card_no, [0, 0, 0, 0]) for card_no in page}
+
+    view.update({
+        "cards": cards,
+        "cards_total": cards_total,
+        "cards_offset": max(0, cards_offset),
+        "cards_page_size": CARD_PAGE_SIZE,
+        "flagged": flagged,
+        "flagged_total": flagged_total,
+        "flagged_offset": max(0, flagged_offset),
+        "flagged_page_size": FLAGGED_PAGE_SIZE,
+        "unmatched": unmatched,
+        "unmatched_total": unmatched_total,
+        "decisions": decisions,
+    })
+    return view
+
+
+def read_card_cells(conn, run_id: int, card_no: str, code: str = "") -> list[dict]:
+    """Per-question verdicts for one card of one snapshot."""
+    sql = (
+        "SELECT card_no, std_code, status, std_option, detail "
+        "FROM run_card_results WHERE run_id = ? AND card_no = ? AND std_code <> ''"
+    )
+    params: list = [run_id, card_no]
+    if code:
+        sql += " AND std_code = ?"
+        params.append(code)
+    sql += " ORDER BY std_code"
+    return [dict(r) for r in conn.execute(sql, params)]
 
 
 def latest_job(conn):
@@ -451,18 +540,21 @@ def register_routes(app: Flask):
     @app.get("/runs/<int:run_id>")
     def run_detail(run_id: int):
         conn = get_db()
-        view = read_run(conn, run_id)
+        try:
+            flagged_offset = int(request.args.get("flagged_offset", "0"))
+        except ValueError:
+            flagged_offset = 0
+        flagged_offset = max(0, flagged_offset)
+        view = read_run(conn, run_id, flagged_offset=flagged_offset)
         if view is None:
             return render_template("missing.html"), 404
         current = active_run_id(conn)
         review_card = request.args.get("card", "").strip()
         review_code = request.args.get("code", "").strip()
-        review_rows = []
-        if review_card:
-            for cell in view["cards"].get(review_card, []):
-                if review_code and cell["std_code"] != review_code:
-                    continue
-                review_rows.append(cell)
+        review_rows = (
+            read_card_cells(conn, run_id, review_card, review_code)
+            if review_card else []
+        )
         return render_template(
             "run.html", run=view, is_current=(run_id == current),
             job=job_view(latest_job(conn)), recomputing=is_recomputing(conn),
@@ -477,7 +569,13 @@ def register_routes(app: Flask):
     def cards():
         conn = get_db()
         current = active_run_id(conn)
-        view = read_run(conn, current)
+        try:
+            cards_offset = int(request.args.get("cards_offset", "0"))
+        except ValueError:
+            cards_offset = 0
+        cards_offset = max(0, cards_offset)
+        view = read_run(conn, current, include_cards=True,
+                        cards_offset=cards_offset)
         return render_template(
             "cards.html", run=view,
             error=request.args.get("error"), message=request.args.get("message"),
@@ -490,13 +588,13 @@ def register_routes(app: Flask):
             return _back("请选择答题 CSV 文件")
         raw = file.read()
         try:
-            rows = engine.parse_answer_csv(raw)
+            text = engine.decode_csv(raw)
+            del raw
+            rows = engine.validate_answer_csv(text)
         except engine.ValidationError as exc:
             return _back(str(exc))
-        app.worker.submit(
-            "upload_answers", {"csv": engine.decode_csv(raw)}
-        )
-        return _back(None, f"已受理 {len(rows)} 行答题数据，正在重算")
+        app.worker.submit("upload_answers", {"csv": text})
+        return _back(None, f"已受理 {rows} 行答题数据，正在重算")
 
     @app.post("/forms")
     def upload_form():

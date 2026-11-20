@@ -5,7 +5,7 @@
   <section class="card"><p class="muted">还没有统计结果，请先在总览导入数据。</p></section>
 {% else %}
 <section class="card">
-  <h2>无可相容卷式的卡 <span class="badge">{{ run.unmatched|length }}</span>
+  <h2>无可相容卷式的卡 <span class="badge">{{ run.unmatched_total }}</span>
     <span class="muted small">快照 #{{ run.id }}</span></h2>
   {% if run.unmatched %}
     <table class="compact">
@@ -16,6 +16,9 @@
       {% endfor %}
       </tbody>
     </table>
+    {% if run.unmatched_total > run.unmatched|length %}
+      <p class="muted small">仅显示前 {{ run.unmatched|length }} 张，共 {{ run.unmatched_total }} 张。</p>
+    {% endif %}
   {% else %}
     <p class="muted">所有卡都有相容卷式。</p>
   {% endif %}
@@ -33,25 +36,29 @@
   <table class="stats">
     <thead><tr><th>卡号</th><th>计入</th><th>漏答</th><th>待核</th><th>跳过</th></tr></thead>
     <tbody>
-    {% for card_no, cells in run.cards.items() %}
+    {% for card_no, counts in run.cards.items() %}
       <tr>
         <td><a href="{{ url_for('run_detail', run_id=run.id, card=card_no) }}">{{ card_no }}</a></td>
-        {% set ns = namespace(c=0,b=0,f=0,s=0) %}
-        {% for c in cells %}
-          {% if c.status == 'counted' %}{% set ns.c = ns.c + 1 %}
-          {% elif c.status == 'blank' %}{% set ns.b = ns.b + 1 %}
-          {% elif c.status == 'flagged' %}{% set ns.f = ns.f + 1 %}
-          {% else %}{% set ns.s = ns.s + 1 %}{% endif %}
-        {% endfor %}
-        <td>{{ ns.c }}</td>
-        <td>{{ ns.b }}</td>
-        <td class="{{ 'danger' if ns.f else '' }}">{{ ns.f }}</td>
-        <td>{{ ns.s }}</td>
+        <td>{{ counts[0] }}</td>
+        <td>{{ counts[1] }}</td>
+        <td class="{{ 'danger' if counts[2] else '' }}">{{ counts[2] }}</td>
+        <td>{{ counts[3] }}</td>
       </tr>
     {% endfor %}
     </tbody>
   </table>
   </div>
+  {% if run.cards_total > run.cards_page_size %}
+    <p class="pager">
+      {% if run.cards_offset > 0 %}
+        <a class="button ghost" href="{{ url_for('cards', cards_offset=[run.cards_offset - run.cards_page_size, 0]|max) }}">上一页</a>
+      {% endif %}
+      <span class="muted small">第 {{ run.cards_offset + 1 }}–{{ run.cards_offset + run.cards|length }} / {{ run.cards_total }} 张</span>
+      {% if run.cards_offset + run.cards_page_size < run.cards_total %}
+        <a class="button ghost" href="{{ url_for('cards', cards_offset=run.cards_offset + run.cards_page_size) }}">下一页</a>
+      {% endif %}
+    </p>
+  {% endif %}
 </section>
 {% endif %}
 {% endblock %}

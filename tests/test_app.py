@@ -531,3 +531,158 @@ def test_queued_job_replayed_after_restart(app):
         time.sleep(0.05)
     assert result is not None
     assert result["stats"]["Q1"]["counted"] == 1
+
+
+# --------------------------------------------------------------------------
+# Bounded-memory recompute / paged reads
+# --------------------------------------------------------------------------
+
+def _seed_many_cards(app, cards, questions=20):
+    """Populate answer_rows directly (fast) with one form covering `questions`."""
+    with app.app_context():
+        conn = db.connect(app.config["DB_PATH"])
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO forms(name, created_at) VALUES ('A卷', '2026-01-01 00:00:00')"
+        )
+        form_id = conn.execute("SELECT id FROM forms").fetchone()["id"]
+        mappings = []
+        for q in range(1, questions + 1):
+            for letter in "ABCD":
+                mappings.append((form_id, str(q), letter, f"Q{q:02d}", letter))
+        conn.executemany(
+            "INSERT INTO form_mappings(form_id,q_no,letter,std_code,std_option) "
+            "VALUES (?,?,?,?,?)", mappings,
+        )
+        rows = []
+        for c in range(cards):
+            card = f"C{c + 1:06d}"
+            for q in range(1, questions + 1):
+                rows.append((card, str(q), "ABCD"[(c + q) % 4], f"Q{q:02d}"))
+        conn.executemany(
+            "INSERT INTO answer_rows(card_no,q_no,letter,scanned_code) "
+            "VALUES (?,?,?,?)", rows,
+        )
+        conn.execute("COMMIT")
+        conn.close()
+
+
+def test_streaming_recompute_matches_in_memory_result(app):
+    """The bounded-memory path must be identical to the in-memory engine."""
+    upload(app.test_client(), "/forms", A_FORM, name="A卷")
+    upload(app.test_client(), "/answers", answer_csv([
+        ("C1", "1", "A", "Q1"), ("C1", "2", "B", "Q2"),
+        ("C2", "1", "B", ""), ("C2", "2", "", ""),
+        ("C3", "1", "A", "Q9"), ("C3", "2", "B", "Q2"),
+    ]))
+    with app.app_context():
+        conn = db.connect(app.config["DB_PATH"])
+        try:
+            expected = engine.compute(conn)
+            conn.execute("BEGIN IMMEDIATE")
+            run_id, streamed = engine.compute_and_persist(
+                conn, "2026-01-01 00:00:00"
+            )
+            conn.execute("COMMIT")
+            assert streamed.stats == expected.stats
+            assert streamed.summary() == expected.summary()
+            # Per-card rows were written, including the unmatched sentinel.
+            got = [
+                (r["card_no"], r["std_code"], r["status"], r["std_option"])
+                for r in conn.execute(
+                    "SELECT card_no, std_code, status, std_option "
+                    "FROM run_card_results WHERE run_id = ? "
+                    "ORDER BY card_no, std_code", (run_id,)
+                )
+            ]
+            want = [
+                (r["card_no"], r["std_code"], r["status"], r["std_option"])
+                for r in expected.card_results
+            ]
+            assert got == want
+        finally:
+            conn.close()
+
+
+def test_recompute_memory_does_not_grow_with_card_count(app):
+    """Peak traced memory of a recompute must not scale with the card count."""
+    import gc
+    import tracemalloc
+
+    _seed_many_cards(app, cards=1000, questions=10)
+
+    def peak_for(conn):
+        gc.collect()
+        tracemalloc.start()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            engine.compute_and_persist(conn, "2026-01-01 00:00:00")
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+            conn.execute("ROLLBACK")
+        return peak
+
+    with app.app_context():
+        conn = db.connect(app.config["DB_PATH"])
+        try:
+            small = peak_for(conn)
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO answer_rows(card_no,q_no,letter,scanned_code) "
+                "SELECT 'D' || card_no, q_no, letter, scanned_code FROM answer_rows"
+            )
+            conn.execute("COMMIT")
+            large = peak_for(conn)
+        finally:
+            conn.close()
+
+    # Doubling the cards must not double the working set.  Allow generous
+    # slack for Python/SQLite bookkeeping but reject linear growth.
+    assert large < small * 1.5 + 2 * 1024 * 1024, (small, large)
+
+
+def test_flagged_cells_are_paged(client, app):
+    _seed_many_cards(app, cards=300, questions=3)
+    # Two forms that disagree on options make every cell flagged.
+    form_b = form_csv([
+        ("1", "A", "Q01", "D"), ("1", "B", "Q01", "C"),
+        ("1", "C", "Q01", "B"), ("1", "D", "Q01", "A"),
+        ("2", "A", "Q02", "D"), ("2", "B", "Q02", "C"),
+        ("2", "C", "Q02", "B"), ("2", "D", "Q02", "A"),
+        ("3", "A", "Q03", "D"), ("3", "B", "Q03", "C"),
+        ("3", "C", "Q03", "B"), ("3", "D", "Q03", "A"),
+    ])
+    upload(client, "/forms", form_b, name="B卷")
+    with app.app_context():
+        conn = db.connect(app.config["DB_PATH"])
+        run_id = db.active_run_id(conn)
+        view = read_run(conn, run_id)
+        conn.close()
+
+    assert view["flagged_total"] > view["flagged_page_size"]
+    page1 = client.get(f"/runs/{run_id}").get_data(as_text=True)
+    page2 = client.get(
+        f"/runs/{run_id}?flagged_offset={view['flagged_page_size']}"
+    ).get_data(as_text=True)
+    assert "下一页" in page1
+    assert page1 != page2
+
+
+def test_card_table_is_paged_and_summary_consistent(client, app):
+    _seed_many_cards(app, cards=250, questions=3)
+    upload(client, "/forms", form_csv([
+        ("1", "A", "Q01", "A"), ("1", "B", "Q01", "B"),
+        ("2", "A", "Q02", "A"), ("2", "B", "Q02", "B"),
+        ("3", "A", "Q03", "A"), ("3", "B", "Q03", "B"),
+    ]), name="B卷")
+    with app.app_context():
+        conn = db.connect(app.config["DB_PATH"])
+        view = read_run(conn, db.active_run_id(conn), include_cards=True)
+        assert len(view["cards"]) <= view["cards_page_size"]
+        assert view["cards_total"] == view["summary"]["cards_matched"]
+        conn.close()
+
+    first = client.get("/cards").get_data(as_text=True)
+    assert first.count("<tr>") <= 200 + 2  # header rows
+    assert "下一页" in first
